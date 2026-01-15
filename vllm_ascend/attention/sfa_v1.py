@@ -909,6 +909,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                                        sin,
                                        rope_dim=self.qk_rope_head_dim,
                                        is_neox_style=True)
+            k = self._pseudo_quant_per_token_head(k)
+            q = self._pseudo_quant_per_token_head(q)
         else:
             k_pe, k_nope = torch.split(
                 k,
@@ -923,6 +925,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             q = None
 
         return q, k
+
+    def _pseudo_quant_per_token_head(
+        self,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = tensor.dtype
+        last_dim = tensor.shape[-1]
+        quant_input = tensor.reshape(-1, last_dim)
+        quantized, pertoken_scale = torch_npu.npu_dynamic_quant(quant_input)
+        dequantized = torch_npu.npu_anti_quant(quantized, pertoken_scale)
+        dequantized = dequantized.reshape(tensor.shape)
+        if dequantized.dtype != orig_dtype:
+            dequantized = dequantized.to(orig_dtype)
+        return dequantized
 
     def indexer_select_post_process(
         self,
