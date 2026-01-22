@@ -154,6 +154,135 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> grouped_matmul_swiglu_quant_weigh
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(output, output_scale, output_offset);
 }
 
+std::tuple<at::Tensor, at::Tensor> grouped_matmul_swiglu_quant_v2_meta(
+    const at::Tensor & x,
+    const at::TensorList & weight,
+    const at::TensorList & weight_scale,
+    const at::Tensor & x_scale,
+    const at::Tensor & group_list,
+    const c10::optional<at::TensorList> & weight_assist_matrix,
+    const c10::optional<at::Tensor> & bias,
+    const c10::optional<at::Tensor> & smooth_scale,
+    int64_t dequant_mode,
+    int64_t dequant_dtype,
+    int64_t quant_mode,
+    int64_t group_list_type,
+    const c10::optional<at::IntArrayRef> & tuning_config)
+{
+    auto x_size = x.sizes();
+    int n = weight[0].sizes()[1];
+    int m = x_size[0];
+    int k = x_size[1];
+
+    at::Tensor output = at::empty({m, n/2}, x.options().dtype(x.dtype()));
+    at::Tensor output_scale = at::empty({m}, x.options().dtype(at::kFloat));
+
+    return std::tuple<at::Tensor, at::Tensor>(output, output_scale);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_distribute_dispatch_v2_meta(
+    const at::Tensor & x,
+    const at::Tensor & expert_ids,
+    const c10::optional<at::Tensor> & scales_optional,
+    const c10::optional<at::Tensor> & x_active_mask_optional,
+    const c10::optional<at::Tensor> & expert_scales_optional,
+    c10::string_view group_ep,
+    int64_t ep_world_size,
+    int64_t ep_rank_id,
+    int64_t moe_expert_num,
+    c10::optional<c10::string_view> group_tp,
+    int64_t tp_world_size,
+    int64_t tp_rank_id,
+    int64_t expert_shard_type,
+    int64_t shared_expert_num,
+    int64_t shared_expert_rank_num,
+    int64_t quant_mode,
+    int64_t global_bs,
+    int64_t expert_token_nums_type,
+    c10::optional<c10::string_view> comm_alg)
+{
+    const int DIM_TWO = 2;
+    
+    // 参数校验
+    TORCH_CHECK((ep_rank_id >= 0) && (ep_rank_id < ep_world_size),
+                "ep_rank_id should be in [0, ep_world_size), but got ep_world_size: ",
+                ep_world_size, ", ep_rank_id: ", ep_rank_id);
+    TORCH_CHECK((shared_expert_rank_num >= 0) && (shared_expert_rank_num < ep_world_size),
+                "shared_expert_rank_num should be in [0, ep_world_size), but got ep_world_size: ",
+                ep_world_size, ", shared_expert_rank_num: ", shared_expert_rank_num);
+    
+    bool is_shared_default = ((shared_expert_num == 1) && (shared_expert_rank_num == 0));
+    bool is_no_shared = ((shared_expert_num == 0) && (shared_expert_rank_num == 0));
+    bool is_valid_shared = ((shared_expert_num > 0)
+        && ((shared_expert_rank_num / shared_expert_num) > 0)
+        && ((shared_expert_rank_num % shared_expert_num) == 0));
+    TORCH_CHECK(is_shared_default || is_no_shared || is_valid_shared,
+                "shared expert setting invalid, got shared_expert_num: ", shared_expert_num,
+                ", shared_expert_rank_num: ", shared_expert_rank_num);
+    
+    auto x_size = x.sizes();
+    auto expert_ids_size = expert_ids.sizes();
+    
+    int64_t bs = x_size[0];
+    int64_t h = x_size[1];
+    int64_t k = expert_ids_size[1];
+    
+    bool shared_front = (expert_shard_type == 0);
+    at::ScalarType outDtype = x.scalar_type();
+    
+    int64_t local_moe_expert_num = 1;
+    int64_t global_bs_real = (global_bs == 0) ? (bs * ep_world_size) : global_bs;
+    int64_t a = 0;
+    
+    if (shared_front) {
+        if (ep_rank_id < shared_expert_rank_num) {
+            local_moe_expert_num = 1;
+            int64_t max_bs = global_bs_real / ep_world_size;
+            int64_t rank_num_per_shared_expert = shared_expert_rank_num / shared_expert_num;
+            int64_t max_shared_group_num = (ep_world_size + rank_num_per_shared_expert - 1) / rank_num_per_shared_expert;
+            a = max_bs * max_shared_group_num;
+        } else {
+            local_moe_expert_num = moe_expert_num / (ep_world_size - shared_expert_rank_num);
+            a = global_bs_real * std::min(local_moe_expert_num, k);
+        }
+    }
+    
+    int64_t ep_recv_cnt_num = 0;
+    if (tp_world_size == DIM_TWO) {
+        ep_recv_cnt_num = ep_world_size * local_moe_expert_num * tp_world_size;
+    } else {
+        ep_recv_cnt_num = ep_world_size * local_moe_expert_num;
+    }
+    
+    if (scales_optional.has_value() || quant_mode != 0) {
+        outDtype = at::kChar;
+    }
+    
+    at::Tensor assist_info_for_combine = at::empty({std::max(bs * k, a * 128)}, x.options().dtype(at::kInt));
+    at::Tensor expand_x;
+    at::Tensor dynamic_scales;
+    if (tp_world_size == 0) {
+        expand_x = at::empty({a, h}, x.options().dtype(outDtype));
+        dynamic_scales = at::empty({a}, x.options().dtype(at::kFloat));
+    } else {
+        expand_x = at::empty({a * tp_world_size, h}, x.options().dtype(outDtype));
+        dynamic_scales = at::empty({a * tp_world_size}, x.options().dtype(at::kFloat));
+    }
+    at::Tensor expert_token_nums = at::empty({local_moe_expert_num}, x.options().dtype(at::kLong));
+    at::Tensor ep_recv_counts = at::empty({ep_recv_cnt_num}, x.options().dtype(at::kInt));
+    at::Tensor tp_recv_counts = at::empty({tp_world_size}, x.options().dtype(at::kInt));
+    at::Tensor expand_scales = at::empty({0}, x.options().dtype(at::kFloat));
+    
+    if (expert_scales_optional.has_value() && expert_scales_optional.value().defined()) {
+        ep_recv_cnt_num = ep_world_size * local_moe_expert_num + global_bs_real * 2 * k * (ep_world_size / 8);
+        ep_recv_counts = at::empty({ep_recv_cnt_num}, x.options().dtype(at::kInt));
+        expand_scales = at::empty({a}, x.options().dtype(at::kFloat));
+    }
+    
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>(
+        expand_x, dynamic_scales, assist_info_for_combine, expert_token_nums, ep_recv_counts, tp_recv_counts, expand_scales);
+}
+
 std::tuple<at::Tensor, at::Tensor> dispatch_gmm_combine_decode_meta(
     const at::Tensor &x,
     const at::Tensor &expert_ids,
@@ -425,6 +554,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant", &vllm_ascend::meta::grouped_matmul_swiglu_quant);
     // Grouped matmul swiglu quant weight nz tensor list
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
+    // Grouped matmul swiglu quant v2
+    ops.impl("grouped_matmul_swiglu_quant_v2", &vllm_ascend::meta::grouped_matmul_swiglu_quant_v2_meta);
+    // Moe distribute dispatch v2
+    ops.impl("moe_distribute_dispatch_v2", &vllm_ascend::meta::moe_distribute_dispatch_v2_meta);
     // dispatch_gmm_combine_decode meta implementation
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // batch_matmul_transpose
